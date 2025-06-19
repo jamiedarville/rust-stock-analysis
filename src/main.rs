@@ -1,28 +1,67 @@
 use chrono::NaiveDate;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use futures::stream::{self, StreamExt};
-use log::{error, info, warn};
+use log::{error, info};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fs::File;
 use std::num::ParseFloatError;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
+use yfinance::Quote;
 
 // --- Configuration ---
 
-const API_CALL_DELAY_SECS: u64 = 13; // To stay within 5 calls/minute AlphaVantage free tier limit.
+const API_CALL_DELAY_SECS: u64 = 1; // To stay within 5 calls/minute AlphaVantage free tier limit.
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    #[clap(short, long, default_value_t = -10.0)]
-    drop_threshold: f64,
+    #[clap(
+        short,
+        long,
+        value_enum,
+        required = true,
+        help = "Select the data source to use"
+    )]
+    source: DataSource,
 
-    #[clap(short, long, default_value_t = 5)] // Reduced default due to API limits
-    max_concurrent_requests: usize,
+    #[clap(
+        short,
+        long,
+        required = true,
+        help = "The percentage drop threshold to report on (e.g., -10.0)"
+    )]
+    threshold: f64,
+
+    #[clap(
+        short,
+        long,
+        required = true,
+        help = "Maximum number of concurrent requests"
+    )]
+    concurrent_requests: usize,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum DataSource {
+    AlphaVantage,
+    YFinance,
+}
+
+impl FromStr for DataSource {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "alphavantage" => Ok(DataSource::AlphaVantage),
+            "yfinance" => Ok(DataSource::YFinance),
+            _ => Err("no match"),
+        }
+    }
 }
 
 // --- Data Structures for Alpha Vantage API Response ---
@@ -91,6 +130,8 @@ enum AppError {
     ApiLimit(String, String),
     #[error("Could not parse data for ticker: {0}")]
     ParsingError(String),
+    #[error("YFinance error: {0}")]
+    YFinanceError(String),
 }
 
 // --- Main Application Logic ---
@@ -100,14 +141,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
     env_logger::init();
     dotenvy::dotenv().expect("Failed to read .env file");
     let args = Args::parse();
-
-    let api_key = std::env::var("ALPHAVANTAGE_API_KEY").map_err(|_| AppError::ApiKeyMissing)?;
+    let api_key = if matches!(args.source, DataSource::AlphaVantage) {
+        Some(std::env::var("ALPHAVANTAGE_API_KEY").map_err(|_| AppError::ApiKeyMissing)?)
+    } else {
+        None
+    };
 
     let tickers = load_tickers("us_public_tickers.csv")?;
     println!(
-        "Loaded {} valid tickers. Starting analysis with {} concurrent requests.",
+        "Loaded {} valid tickers. Starting analysis with {} concurrent requests using {}.",
         tickers.len(),
-        args.max_concurrent_requests
+        args.concurrent_requests,
+        match args.source {
+            DataSource::AlphaVantage => "AlphaVantage",
+            DataSource::YFinance => "YFinance",
+        }
     );
 
     let client = Client::builder()
@@ -117,17 +165,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let results = analyze_stocks(
         client,
         tickers,
-        args.max_concurrent_requests,
-        args.drop_threshold,
+        args.concurrent_requests,
+        args.threshold,
         api_key,
+        args.source,
     )
     .await;
 
-    if results.is_empty() {
-        println!("\n🎉 No stocks found with significant drops today!");
-    } else {
+    if !results.is_empty() {
         display_results(&results);
-        save_results_to_csv(&results)?;
+        save_results_to_csv(&results, "yfinance")?;
     }
 
     Ok(())
@@ -150,7 +197,8 @@ async fn analyze_stocks(
     tickers: Vec<String>,
     max_concurrent_requests: usize,
     drop_threshold: f64,
-    api_key: String,
+    api_key: Option<String>,
+    source: DataSource,
 ) -> Vec<StockAnalysis> {
     let api_key = Arc::new(api_key);
 
@@ -159,11 +207,24 @@ async fn analyze_stocks(
         .map(|ticker| {
             let client = client.clone();
             let api_key = Arc::clone(&api_key);
+            let source = source.clone();
             tokio::spawn(async move {
                 // Delay to respect API rate limits.
                 tokio::time::sleep(StdDuration::from_secs(API_CALL_DELAY_SECS)).await;
-                let result =
-                    fetch_and_analyze_stock(&client, &ticker, drop_threshold, &api_key).await;
+                let result = match source {
+                    DataSource::AlphaVantage => {
+                        fetch_and_analyze_stock(
+                            &client,
+                            &ticker,
+                            drop_threshold,
+                            api_key.as_ref().as_deref().unwrap(),
+                        )
+                        .await
+                    }
+                    DataSource::YFinance => {
+                        fetch_and_analyze_stock_yfinance(&ticker, drop_threshold).await
+                    }
+                };
                 (ticker, result)
             })
         })
@@ -190,20 +251,19 @@ async fn analyze_stocks(
                 dropped_stocks.push(analysis);
             }
             Ok((ticker, Ok(None))) => {
-                println!("[INFO] {}: No significant drop detected.", ticker);
+                println!("[INFO] {}: success.", ticker);
                 successful_analyses += 1;
             }
             Ok((ticker, Err(e))) => {
-                println!("[ERROR] {}: Analysis failed. Reason: {}", ticker, e);
+                println!("[ERROR] {}: timed out. Reason: {}", ticker, e);
                 failed_analyses += 1;
             }
             Err(e) => {
-                error!("A spawned task failed: {}", e);
+                error!("[ERROR] A spawned task failed: {}", e);
                 failed_analyses += 1;
             }
         }
     }
-
     println!("\n--- Analysis Complete ---");
     println!("Total tickers processed: {}", total_tickers);
     println!("Successful analyses: {}", successful_analyses);
@@ -284,8 +344,54 @@ fn display_results(results: &[StockAnalysis]) {
     }
 }
 
-fn save_results_to_csv(results: &[StockAnalysis]) -> Result<(), AppError> {
-    let filename = format!("stock_drops_alphavantage_{}.csv", chrono::Utc::now().format("%Y%m%d"));
+async fn fetch_and_analyze_stock_yfinance(
+    ticker: &str,
+    drop_threshold: f64,
+) -> Result<Option<StockAnalysis>, AppError> {
+    let quote = yfinance::get_quote(ticker)
+        .await
+        .map_err(|e| AppError::YFinanceError(e.to_string()))?;
+    let quote = quote.ok_or(AppError::YFinanceError(format!(
+        "No data found for ticker {}",
+        ticker
+    )))?;
+
+    analyze_quote(ticker, quote, drop_threshold)
+}
+
+fn analyze_quote(
+    ticker: &str,
+    quote: Quote,
+    drop_threshold: f64,
+) -> Result<Option<StockAnalysis>, AppError> {
+    let previous_close = quote.previous_close;
+    let current_price = quote.last_trade_price.unwrap_or(quote.regular_market_price);
+
+    if previous_close == 0.0 {
+        return Ok(None);
+    }
+
+    let percent_change = ((current_price - previous_close) / previous_close) * 100.0;
+
+    if percent_change <= drop_threshold {
+        Ok(Some(StockAnalysis {
+            symbol: ticker.to_string(),
+            current_price,
+            previous_close,
+            percent_change,
+            date: chrono::Utc::now().naive_utc().date(), // YFinance doesn't provide a date per quote
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn save_results_to_csv(results: &[StockAnalysis], source: &str) -> Result<(), AppError> {
+    let filename = format!(
+        "stock_drops_{}_{}.csv",
+        source,
+        chrono::Utc::now().format("%Y%m%d")
+    );
     let mut wtr = csv::Writer::from_path(&filename)?;
     for result in results {
         wtr.serialize(result)?;
