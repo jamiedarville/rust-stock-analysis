@@ -104,7 +104,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let api_key = std::env::var("ALPHAVANTAGE_API_KEY").map_err(|_| AppError::ApiKeyMissing)?;
 
     let tickers = load_tickers("us_public_tickers.csv")?;
-    info!(
+    println!(
         "Loaded {} valid tickers. Starting analysis with {} concurrent requests.",
         tickers.len(),
         args.max_concurrent_requests
@@ -154,41 +154,65 @@ async fn analyze_stocks(
 ) -> Vec<StockAnalysis> {
     let api_key = Arc::new(api_key);
 
-    let mut results: Vec<_> = stream::iter(tickers)
+    println!("\n--- Starting Stock Analysis ---");
+    let all_results: Vec<_> = stream::iter(tickers)
         .map(|ticker| {
             let client = client.clone();
             let api_key = Arc::clone(&api_key);
             tokio::spawn(async move {
                 // Delay to respect API rate limits.
                 tokio::time::sleep(StdDuration::from_secs(API_CALL_DELAY_SECS)).await;
-                let result = fetch_and_analyze_stock(&client, &ticker, drop_threshold, &api_key).await;
+                let result =
+                    fetch_and_analyze_stock(&client, &ticker, drop_threshold, &api_key).await;
                 (ticker, result)
             })
         })
         .buffer_unordered(max_concurrent_requests)
-        .filter_map(|res| async move {
-            match res {
-                Ok((_ticker, Ok(Some(analysis)))) => {
-                    info!("Found significant drop for {}", analysis.symbol);
-                    Some(analysis)
-                }
-                Ok((ticker, Err(e))) => {
-                    warn!("Could not analyze stock {}: {}", ticker, e);
-                    None
-                }
-                Err(e) => {
-                    error!("A spawned task failed: {}", e);
-                    None
-                }
-                _ => None,
-            }
-        })
         .collect()
         .await;
 
+    let total_tickers = all_results.len();
+    let mut successful_analyses = 0;
+    let mut failed_analyses = 0;
+    let mut dropped_stocks = Vec::new();
+
+    for res in all_results {
+        match res {
+            Ok((ticker, Ok(Some(analysis)))) => {
+                println!(
+                    "[DROPPED] {}: Change {:.2}%, Current Price: ${:.2}, Previous Close: ${:.2}",
+                    analysis.symbol,
+                    analysis.percent_change,
+                    analysis.current_price,
+                    analysis.previous_close
+                );
+                successful_analyses += 1;
+                dropped_stocks.push(analysis);
+            }
+            Ok((ticker, Ok(None))) => {
+                println!("[INFO] {}: No significant drop detected.", ticker);
+                successful_analyses += 1;
+            }
+            Ok((ticker, Err(e))) => {
+                println!("[ERROR] {}: Analysis failed. Reason: {}", ticker, e);
+                failed_analyses += 1;
+            }
+            Err(e) => {
+                error!("A spawned task failed: {}", e);
+                failed_analyses += 1;
+            }
+        }
+    }
+
+    println!("\n--- Analysis Complete ---");
+    println!("Total tickers processed: {}", total_tickers);
+    println!("Successful analyses: {}", successful_analyses);
+    println!("Failed analyses: {}", failed_analyses);
+    println!("Stocks with significant drops: {}", dropped_stocks.len());
+
     // Sort results by the percentage change, from most dropped to least.
-    results.sort_by(|a, b| a.percent_change.partial_cmp(&b.percent_change).unwrap());
-    results
+    dropped_stocks.sort_by(|a, b| a.percent_change.partial_cmp(&b.percent_change).unwrap());
+    dropped_stocks
 }
 
 async fn fetch_and_analyze_stock(
@@ -267,6 +291,6 @@ fn save_results_to_csv(results: &[StockAnalysis]) -> Result<(), AppError> {
         wtr.serialize(result)?;
     }
     wtr.flush()?;
-    info!("Results saved to {}", filename);
+    println!("Results saved to {}", filename);
     Ok(())
 }
